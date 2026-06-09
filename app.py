@@ -77,17 +77,19 @@ app = FastAPI(lifespan=lifespan, root_path="/inhouse_llm")
 class TranscriptionResponse(BaseModel):
     transcription: str
 
-@app.post("/v1/audio/transcription", response_model=TranscriptionResponse)
+@app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
 async def transcribe(
     language: str = Form(...),
-    audio: UploadFile = File(...),
+    file: UploadFile = File(...),
+    model: str = Form(default=None),
+    response_format: str = Form(default="json"),
 ):
-    if not audio.filename and not await audio.read(1):
+    if not file.filename and not await file.read(1):
         raise HTTPException(status_code=400, detail="No audio file received.")
- 
-    await audio.seek(0)
-    raw_bytes = await audio.read()
- 
+
+    await file.seek(0)
+    raw_bytes = await file.read()
+
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Audio file is empty.")
  
@@ -124,5 +126,4 @@ async def transcribe(
         output_ids[0][input_len:],
         skip_special_tokens=True,
     ).strip()
-    transcript = TranscriptionResponse(transcription=transcription)
-    return transcript.transcription
+    return TranscriptionResponse(transcription=transcription)
