@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
         max_memory=max_memory,
     )
     gen_config = GenerationConfig.from_pretrained(MODEL_ID)
-    gen_config.max_new_tokens = 512
+    gen_config.max_new_tokens = 4096
     yield
     del model
     del processor
