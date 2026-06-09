@@ -1,27 +1,46 @@
 import io
+import os
 import torch
 import librosa
-import numpy as np
 import soundfile as sf
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from pydantic import BaseModel
 from transformers import AutoProcessor, AutoModelForMultimodalLM, GenerationConfig
+from dotenv import load_dotenv
+load_dotenv()
 
 MODEL_ID = "google/gemma-4-12B-it"
+GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.70"))
 
 processor: AutoProcessor = None
 model: AutoModelForMultimodalLM = None
 gen_config: GenerationConfig = None
 
+def build_max_memory() -> dict:
+    if not torch.cuda.is_available():
+        return None
+    max_memory = {}
+    for i in range(torch.cuda.device_count()):
+        total_bytes = torch.cuda.get_device_properties(i).total_memory
+        reserved_bytes = torch.cuda.memory_reserved(i)
+        free_bytes = total_bytes - reserved_bytes
+        allowed_bytes = int(free_bytes * GPU_MEMORY_UTILIZATION)
+        max_memory[i] = allowed_bytes
+    print(f"Using {max_memory} of memory.")
+    return max_memory
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global processor, model, gen_config
+    max_memory = build_max_memory()
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     model = AutoModelForMultimodalLM.from_pretrained(
         MODEL_ID,
         torch_dtype="auto",
         device_map="auto",
+        max_memory=max_memory,
     )
     gen_config = GenerationConfig.from_pretrained(MODEL_ID)
     gen_config.max_new_tokens = 512
