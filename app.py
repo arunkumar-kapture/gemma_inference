@@ -6,6 +6,7 @@ import soundfile as sf
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from pydantic import BaseModel
+import numpy as np
 from transformers import AutoProcessor, AutoModelForMultimodalLM, GenerationConfig
 from dotenv import load_dotenv
 load_dotenv()
@@ -29,6 +30,27 @@ def build_max_memory() -> dict:
         max_memory[i] = allowed_bytes
     print(f"Using {max_memory} of memory.")
     return max_memory
+
+
+def load_audio(raw_bytes: bytes) -> np.ndarray:
+    try:
+        audio_array, _ = librosa.load(io.BytesIO(raw_bytes), sr=16000, mono=True)
+        return audio_array
+    except Exception:
+        pass
+ 
+    try:
+        import soundfile as sf
+        audio_array, sr = sf.read(io.BytesIO(raw_bytes))
+        if audio_array.ndim > 1:
+            audio_array = audio_array.mean(axis=1)
+        if sr != 16000:
+            audio_array = librosa.resample(audio_array.astype(np.float32), orig_sr=sr, target_sr=16000)
+        return audio_array.astype(np.float32)
+    except Exception:
+        pass
+ 
+    raise HTTPException(status_code=422, detail="Could not decode audio. Send wav, mp3, flac, or ogg.")
 
 
 @asynccontextmanager
@@ -55,19 +77,21 @@ app = FastAPI(lifespan=lifespan, root_path="/inhouse_llm")
 class TranscriptionResponse(BaseModel):
     transcription: str
 
-@app.post("/gemma/transcribe", response_model=TranscriptionResponse)
+@app.post("/v1/audio/transcription", response_model=TranscriptionResponse)
 async def transcribe(
-    language: str = Form(..., description="Language of the audio (e.g. 'English', 'Tamil', 'Hindi')"),
-    audio: UploadFile = File(..., description="Audio file (wav, mp3, flac, ogg, etc.)"),
+    language: str = Form(...),
+    audio: UploadFile = File(...),
 ):
-    if not audio.content_type.startswith("audio/"):
-        raise HTTPException(status_code=400, detail="Uploaded file must be an audio file.")
-
+    if not audio.filename and not await audio.read(1):
+        raise HTTPException(status_code=400, detail="No audio file received.")
+ 
+    await audio.seek(0)
     raw_bytes = await audio.read()
-    try:
-        audio_array, _ = librosa.load(io.BytesIO(raw_bytes), sr=16000, mono=True)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Could not decode audio file: {e}")
+ 
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Audio file is empty.")
+ 
+    audio_array = load_audio(raw_bytes)
 
     messages = [
         {
@@ -75,10 +99,7 @@ async def transcribe(
             "content": [
                 {
                     "type": "text",
-                    "text": (
-                        f"Transcribe the following speech segment in {language}. "
-                        "Only output the transcription with no newlines, no commentary, and no explanation."
-                    ),
+                    "text": f"Transcribe the following {language} audio. Only output the transcription exactly as user spoken.",
                 },
                 {
                     "type": "audio",
@@ -103,4 +124,5 @@ async def transcribe(
         output_ids[0][input_len:],
         skip_special_tokens=True,
     ).strip()
-    return TranscriptionResponse(transcription=transcription)
+    transcript = TranscriptionResponse(transcription=transcription)
+    return transcript.transcription
