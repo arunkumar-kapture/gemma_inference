@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
     torch.cuda.empty_cache()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, root_path="/inhouse_llm")
 
 class TranscriptionResponse(BaseModel):
     transcription: str
