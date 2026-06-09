@@ -75,13 +75,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan, root_path="/inhouse_llm")
 
 class TranscriptionResponse(BaseModel):
-    transcription: str
+    text: str
 
 @app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
 async def transcribe(
     language: str = Form(...),
     file: UploadFile = File(...),
-    model: str = Form(default=None),
     response_format: str = Form(default="json"),
 ):
     if not file.filename and not await file.read(1):
@@ -126,4 +125,4 @@ async def transcribe(
         output_ids[0][input_len:],
         skip_special_tokens=True,
     ).strip()
-    return TranscriptionResponse(transcription=transcription)
+    return TranscriptionResponse(text=transcription)
