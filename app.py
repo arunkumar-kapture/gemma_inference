@@ -2,12 +2,11 @@ import io
 import os
 import torch
 import librosa
-import soundfile as sf
+import numpy as np
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from pydantic import BaseModel
-import numpy as np
-from transformers import AutoProcessor, AutoModelForMultimodalLM, GenerationConfig
+from transformers import AutoProcessor, Gemma3ForConditionalGeneration, GenerationConfig
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -15,7 +14,7 @@ MODEL_ID = "google/gemma-4-12B-it"
 GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.70"))
 
 processor: AutoProcessor = None
-model: AutoModelForMultimodalLM = None
+model: Gemma3ForConditionalGeneration = None
 gen_config: GenerationConfig = None
 
 def build_max_memory() -> dict:
@@ -28,29 +27,43 @@ def build_max_memory() -> dict:
         free_bytes = total_bytes - reserved_bytes
         allowed_bytes = int(free_bytes * GPU_MEMORY_UTILIZATION)
         max_memory[i] = allowed_bytes
-    print(f"Using {max_memory} of memory.")
+    print(f"[INFO] GPU max_memory map: {max_memory}")
     return max_memory
 
 
 def load_audio(raw_bytes: bytes) -> np.ndarray:
     try:
         audio_array, _ = librosa.load(io.BytesIO(raw_bytes), sr=16000, mono=True)
-        return audio_array
+        return audio_array.astype(np.float32)
     except Exception:
         pass
- 
+
     try:
         import soundfile as sf
         audio_array, sr = sf.read(io.BytesIO(raw_bytes))
         if audio_array.ndim > 1:
             audio_array = audio_array.mean(axis=1)
         if sr != 16000:
-            audio_array = librosa.resample(audio_array.astype(np.float32), orig_sr=sr, target_sr=16000)
+            audio_array = librosa.resample(
+                audio_array.astype(np.float32), orig_sr=sr, target_sr=16000
+            )
         return audio_array.astype(np.float32)
     except Exception:
         pass
- 
-    raise HTTPException(status_code=422, detail="Could not decode audio. Send wav, mp3, flac, or ogg.")
+
+    raise HTTPException(
+        status_code=422,
+        detail="Could not decode audio. Supported formats: wav, mp3, flac, ogg.",
+    )
+
+def build_prompt(language: str) -> str:
+    lang_map = {
+        "ta": ("Tamil", "தமிழ் எழுத்துக்கள்"),
+        "hi": ("Hindi", "देवनागरी"),
+        "en": ("English", "Latin script"),
+    }
+    lang_name, script_hint = lang_map.get(language, ("Tamil", "தமிழ் எழுத்துக்கள்"))
+    return  f"Transcribe the following audio exactly as spoken in {lang_name}. Output only the transcription in {script_hint}."
 
 
 @asynccontextmanager
@@ -58,14 +71,17 @@ async def lifespan(app: FastAPI):
     global processor, model, gen_config
     max_memory = build_max_memory()
     processor = AutoProcessor.from_pretrained(MODEL_ID)
-    model = AutoModelForMultimodalLM.from_pretrained(
+    model = Gemma3ForConditionalGeneration.from_pretrained(
         MODEL_ID,
-        torch_dtype="auto",
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         max_memory=max_memory,
     )
+    model.eval()
     gen_config = GenerationConfig.from_pretrained(MODEL_ID)
-    gen_config.max_new_tokens = 4096
+    gen_config.max_new_tokens = 1024
+    gen_config.do_sample = False
+    gen_config.repetition_penalty = 1.3
     yield
     del model
     del processor
@@ -79,12 +95,10 @@ class TranscriptionResponse(BaseModel):
 
 @app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
 async def transcribe(
-    language: str = Form(...),
+    language: str = Form(default="ta"),
     file: UploadFile = File(...),
     response_format: str = Form(default="json"),
 ):
-    if not file.filename and not await file.read(1):
-        raise HTTPException(status_code=400, detail="No audio file received.")
 
     await file.seek(0)
     raw_bytes = await file.read()
@@ -100,7 +114,7 @@ async def transcribe(
             "content": [
                 {
                     "type": "text",
-                    "text": f"Transcribe the following {language} audio. Only output the transcription exactly as user spoken.",
+                    "text": build_prompt(language),
                 },
                 {
                     "type": "audio",
