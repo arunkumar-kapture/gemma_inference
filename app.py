@@ -6,7 +6,7 @@ import numpy as np
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from pydantic import BaseModel
-from transformers import AutoProcessor, Gemma3ForConditionalGeneration, GenerationConfig
+from transformers import AutoProcessor, Gemma4UnifiedForConditionalGeneration, GenerationConfig
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -14,7 +14,7 @@ MODEL_ID = "google/gemma-4-12B-it"
 GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.70"))
 
 processor: AutoProcessor = None
-model: Gemma3ForConditionalGeneration = None
+model: Gemma4UnifiedForConditionalGeneration = None
 gen_config: GenerationConfig = None
 
 def build_max_memory() -> dict:
@@ -63,15 +63,21 @@ def build_prompt(language: str) -> str:
         "en": ("English", "Latin script"),
     }
     lang_name, script_hint = lang_map.get(language, ("Tamil", "தமிழ் எழுத்துக்கள்"))
-    return  f"Transcribe the following audio exactly as spoken in {lang_name}. Output only the transcription in {script_hint}."
+    return (
+        f"Transcribe the following audio exactly as spoken in {lang_name}. "
+        f"Output only the transcription in {script_hint}."
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global processor, model, gen_config
     max_memory = build_max_memory()
+    print(f"[INFO] Loading processor from {MODEL_ID} ...")
     processor = AutoProcessor.from_pretrained(MODEL_ID)
-    model = Gemma3ForConditionalGeneration.from_pretrained(
+
+    print(f"[INFO] Loading model from {MODEL_ID} ...")
+    model = Gemma4UnifiedForConditionalGeneration.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
         device_map="auto",
@@ -82,10 +88,12 @@ async def lifespan(app: FastAPI):
     gen_config.max_new_tokens = 1024
     gen_config.do_sample = False
     gen_config.repetition_penalty = 1.3
+    print("[INFO] Model ready.")
     yield
     del model
     del processor
     torch.cuda.empty_cache()
+    print("[INFO] Model unloaded.")
 
 
 app = FastAPI(lifespan=lifespan, root_path="/inhouse_llm")
