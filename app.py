@@ -2,12 +2,11 @@ import io
 import os
 import torch
 import librosa
-import soundfile as sf
+import numpy as np
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from pydantic import BaseModel
-import numpy as np
-from transformers import AutoProcessor, AutoModelForMultimodalLM, GenerationConfig
+from transformers import AutoProcessor, Gemma4UnifiedForConditionalGeneration, GenerationConfig
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -15,7 +14,7 @@ MODEL_ID = "google/gemma-4-12B-it"
 GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.70"))
 
 processor: AutoProcessor = None
-model: AutoModelForMultimodalLM = None
+model: Gemma4UnifiedForConditionalGeneration = None
 gen_config: GenerationConfig = None
 
 def build_max_memory() -> dict:
@@ -28,53 +27,99 @@ def build_max_memory() -> dict:
         free_bytes = total_bytes - reserved_bytes
         allowed_bytes = int(free_bytes * GPU_MEMORY_UTILIZATION)
         max_memory[i] = allowed_bytes
-    print(f"Using {max_memory} of memory.")
+    print(f"[INFO] GPU max_memory map: {max_memory}")
     return max_memory
 
 
 def load_audio(raw_bytes: bytes) -> np.ndarray:
     try:
         audio_array, _ = librosa.load(io.BytesIO(raw_bytes), sr=16000, mono=True)
-        return audio_array
+        return audio_array.astype(np.float32)
     except Exception:
         pass
- 
+
     try:
         import soundfile as sf
         audio_array, sr = sf.read(io.BytesIO(raw_bytes))
         if audio_array.ndim > 1:
             audio_array = audio_array.mean(axis=1)
         if sr != 16000:
-            audio_array = librosa.resample(audio_array.astype(np.float32), orig_sr=sr, target_sr=16000)
+            audio_array = librosa.resample(
+                audio_array.astype(np.float32), orig_sr=sr, target_sr=16000
+            )
         return audio_array.astype(np.float32)
     except Exception:
         pass
- 
-    raise HTTPException(status_code=422, detail="Could not decode audio. Send wav, mp3, flac, or ogg.")
+
+    raise HTTPException(
+        status_code=422,
+        detail="Could not decode audio. Supported formats: wav, mp3, flac, ogg.",
+    )
+
+
+def build_prompt(language: str) -> str:
+    lang_map = {
+        "ta": ("Tamil", "தமிழ் எழுத்துக்கள்"),
+        "hi": ("Hindi", "देवनागरी"),
+        "en": ("English", "Latin script"),
+        "kn": ("Kannada", "ಕನ್ನಡ ಲಿಪಿ"),
+    }
+    lang_name, script_hint = lang_map.get(language, ("Tamil", "தமிழ் எழுத்துக்கள்"))
+    return f"Language: {lang_name}, Transcribe the following audio exactly as spoken in {lang_name}.Output only the transcription in {lang_name} Example: {script_hint}."
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global processor, model, gen_config
     max_memory = build_max_memory()
+    print(f"[INFO] Loading processor from {MODEL_ID} ...")
     processor = AutoProcessor.from_pretrained(MODEL_ID)
-    model = AutoModelForMultimodalLM.from_pretrained(
+
+    print(f"[INFO] Loading model from {MODEL_ID} ...")
+    model = Gemma4UnifiedForConditionalGeneration.from_pretrained(
         MODEL_ID,
-        torch_dtype="auto",
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         max_memory=max_memory,
+        attn_implementation="eager",  # use "flash_attention_2" if flash-attn is installed
     )
+    model.eval()
+    print("[INFO] Compiling model ...")
+    model.forward = torch.compile(model.forward, mode="reduce-overhead", fullgraph=False)
+
     gen_config = GenerationConfig.from_pretrained(MODEL_ID)
-    gen_config.max_new_tokens = 4096
-    gen_config.do_sample=False
-    gen_config.repetition_penalty = 1.0
-    gen_config.temperature = 1.0
-    gen_config.top_p = 1.0
-    gen_config.top_k = 0
+    gen_config.max_new_tokens = 1024
+    gen_config.do_sample = False
+    gen_config.repetition_penalty = 1.3
+    gen_config.cache_implementation = "static"
+
+    print("[INFO] Running warm-up pass ...")
+    dummy_audio = np.zeros(16000, dtype=np.float32)
+    dummy_messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Transcribe."},
+                {"type": "audio", "audio": dummy_audio},
+            ],
+        }
+    ]
+    dummy_inputs = processor.apply_chat_template(
+        dummy_messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_tensors="pt",
+        return_dict=True,
+    ).to(model.device, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        model.generate(**dummy_inputs, max_new_tokens=10)
+
+    print("[INFO] Model ready.")
     yield
     del model
     del processor
     torch.cuda.empty_cache()
+    print("[INFO] Model unloaded.")
 
 
 app = FastAPI(lifespan=lifespan, root_path="/inhouse_llm")
@@ -84,32 +129,23 @@ class TranscriptionResponse(BaseModel):
 
 @app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
 async def transcribe(
-    language: str = Form(...),
+    language: str = Form(default="ta"),
     file: UploadFile = File(...),
     response_format: str = Form(default="json"),
 ):
-    if not file.filename and not await file.read(1):
-        raise HTTPException(status_code=400, detail="No audio file received.")
-
     await file.seek(0)
     raw_bytes = await file.read()
-
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Audio file is empty.")
+
     audio_array = load_audio(raw_bytes)
 
     messages = [
         {
             "role": "user",
             "content": [
-                {
-                    "type": "text",
-                    "text": f"Language: Tamil. Transcribe the following Tamil audio and output the transcription only in Tamil script (தமிழ் எழுத்துக்கள்). Do not use Romanized Tamil.",
-                },
-                {
-                    "type": "audio",
-                    "audio": audio_array,
-                },
+                {"type": "text", "text": build_prompt(language)},
+                {"type": "audio", "audio": audio_array},
             ],
         }
     ]
